@@ -1,69 +1,122 @@
 import os
 import requests
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
+import pytz # Necesario para manejar la zona horaria de México
 from supabase import create_client, Client
 
-# Configuración de Supabase
+# --- CONFIGURACIÓN ---
+# Asegúrate de que estas variables estén en tus GitHub Secrets
 url: str = os.environ.get("SUPABASE_URL")
 key: str = os.environ.get("SUPABASE_KEY")
+
+if not url or not key:
+    raise ValueError("Error: Faltan las credenciales SUPABASE_URL o SUPABASE_KEY")
+
 supabase: Client = create_client(url, key)
 
-def fetch_ligamx_matches():
-    # El endpoint de FotMob para ligas requiere la fecha. 
-    # Consultaremos un rango de días para cubrir tu requerimiento.
-    league_id = 230
-    base_url = "https://www.fotmob.com/api/leagues"
+def run_scraper():
+    print("--- Iniciando Scraper de Liga de Profetas ---")
     
-    # Rango: -1 día a +7 días
-    start_date = datetime.now() - timedelta(days=1)
-    matches_to_process = []
+    # Usamos el ID 230 (Liga MX). Al no poner fecha, trae la temporada activa.
+    league_id = 230
+    api_url = f"https://www.fotmob.com/api/leagues?id={league_id}&ccode3=MEX"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36"
+    }
 
-    for i in range(9):  # 1 pasado + hoy + 7 futuros
-        current_date = (start_date + timedelta(days=i)).strftime('%Y%m%d')
-        print(f"Consultando fecha: {current_date}")
+    try:
+        # 1. Obtener datos de FotMob
+        print(f"Consultando API: {api_url}")
+        response = requests.get(api_url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
         
-        params = {'id': league_id, 'type': 'league', 'timezone': 'America/Mexico_City'}
-        response = requests.get(base_url, params=params)
+        # FotMob devuelve los partidos en 'matches' -> 'allMatches'
+        all_matches = data.get('matches', {}).get('allMatches', [])
         
-        if response.status_code == 200:
-            data = response.json()
-            # Navegamos en el JSON de FotMob para encontrar los partidos
-            matches = data.get('matches', {}).get('allMatches', [])
-            matches_to_process.extend(matches)
+        if not all_matches:
+            print("ALERTA: FotMob no devolvió partidos. Verifica si cambió la temporada.")
+            return
+
+        print(f"Total de partidos encontrados en el calendario: {len(all_matches)}")
+        
+        # 2. Procesar y guardar en Supabase
+        partidos_procesados = 0
+        equipos_procesados = set() # Para no insertar el mismo equipo mil veces
+
+        for match in all_matches:
+            # Datos básicos
+            match_id = match.get('id')
+            home = match.get('home', {})
+            away = match.get('away', {})
+            status = match.get('status', {})
             
-    return matches_to_process
+            # --- A. Guardar Equipos (Tabla 'teams') ---
+            # Es vital insertar los equipos primero para evitar error de Foreign Key
+            
+            # Equipo Local
+            if home.get('id') not in equipos_procesados:
+                team_data = {
+                    "id": home.get('id'),
+                    "name": home.get('name'),
+                    "logo_url": f"https://images.fotmob.com/image_resources/logo/teamlogo/{home.get('id')}.png"
+                }
+                # Upsert: Si existe no hace nada, si no existe lo crea
+                supabase.table('teams').upsert(team_data).execute()
+                equipos_procesados.add(home.get('id'))
 
-def sync_to_supabase(matches):
-    for m in matches:
-        # 1. Upsert de Equipos (Para evitar errores de FK)
-        teams = [
-            {"id": m['home']['id'], "name": m['home']['name']},
-            {"id": m['away']['id'], "name": m['away']['name']}
-        ]
-        supabase.table("teams").upsert(teams).execute()
+            # Equipo Visitante
+            if away.get('id') not in equipos_procesados:
+                team_data = {
+                    "id": away.get('id'),
+                    "name": away.get('name'),
+                    "logo_url": f"https://images.fotmob.com/image_resources/logo/teamlogo/{away.get('id')}.png"
+                }
+                supabase.table('teams').upsert(team_data).execute()
+                equipos_procesados.add(away.get('id'))
 
-        # 2. Preparar datos del partido
-        match_data = {
-            "id": m['id'],
-            "home_team_id": m['home']['id'],
-            "away_team_id": m['away']['id'],
-            "start_time": m['status']['utcTime'],
-            "status": m['status']['reason'] if 'reason' in m['status'] else "scheduled",
-            "scores": {
-                "home": m['home'].get('score'),
-                "away": m['away'].get('score')
+            # --- B. Guardar Partido (Tabla 'matches') ---
+            
+            # Determinar estado para nuestra BD (scheduled, live, finished)
+            match_status = 'scheduled'
+            if status.get('finished'):
+                match_status = 'finished'
+            elif status.get('started') and not status.get('finished'):
+                match_status = 'live'
+            if status.get('cancelled'):
+                match_status = 'cancelled'
+
+            # Marcadores (manejo de errores si vienen vacíos)
+            try:
+                # FotMob a veces manda el marcador como string "2" o int 2
+                home_score = int(home.get('score', 0)) if home.get('score') is not None else 0
+                away_score = int(away.get('score', 0)) if away.get('score') is not None else 0
+            except ValueError:
+                home_score = 0
+                away_score = 0
+
+            match_record = {
+                "id": match_id,
+                "home_team_id": home.get('id'),
+                "away_team_id": away.get('id'),
+                "start_time": status.get('utcTime'), # Supabase acepta formato ISO UTC directo
+                "home_score": home_score,
+                "away_score": away_score,
+                "status": match_status,
+                "round_name": match.get('roundName', '') # Ej: "Jornada 1"
             }
-        }
-        
-        # 3. Upsert del Partido
-        supabase.table("matches").upsert(match_data).execute()
-        print(f"Sincronizado: {m['home']['name']} vs {m['away']['name']}")
+
+            # Upsert del partido
+            supabase.table('matches').upsert(match_record).execute()
+            partidos_procesados += 1
+
+        print(f"¡Éxito! Se actualizaron/insertaron {partidos_procesados} partidos en Supabase.")
+
+    except Exception as e:
+        print(f"Error Crítico: {e}")
+        exit(1) # Esto le avisa a GitHub Actions que hubo un error (X roja)
 
 if __name__ == "__main__":
-    print("Iniciando actualización de Liga MX...")
-    matches = fetch_ligamx_matches()
-    if matches:
-        sync_to_supabase(matches)
-        print("Sincronización completada con éxito.")
-    else:
-        print("No se encontraron partidos en el rango seleccionado.")
+    run_scraper()
