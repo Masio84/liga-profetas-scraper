@@ -1,31 +1,38 @@
-name: Liga MX Scraper
+name: Actualizar Partidos Liga MX
 
 on:
   schedule:
-    # Se ejecuta al minuto 0 de cada hora
-    - cron: '0 * * * *'
-  workflow_dispatch: # Permite ejecutarlo manualmente desde la interfaz de GitHub
+    # Se ejecuta automáticamente cada 2 horas (minuto 0 de cada hora par)
+    - cron: '0 */2 * * *'
+  # Permite ejecutarlo manualmente con el botón "Run workflow"
+  workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
- 
+  update-matches:
+    runs-on: ubuntu-latest # Usamos la máquina virtual Linux más reciente
+
     steps:
-      - name: Checkout repositorio
-        uses: actions/checkout@v3
+      # 1. Descargar tu código del repositorio
+      - name: Checkout del código
+        uses: actions/checkout@v4
 
+      # 2. Configurar el entorno de Python
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.10' 
 
+      # 3. Instalar librerías (LA CORRECCIÓN ESTÁ AQUÍ)
+      # Agregamos 'pytz' explícitamente en la línea de instalación
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install requests supabase
+          pip install requests supabase pytz
 
-      - name: Ejecutar script de actualización
+      # 4. Ejecutar el script
+      - name: Correr script de actualización
         env:
+          # Conectamos las llaves de Supabase guardadas en Secrets
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python update_matches.py
