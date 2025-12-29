@@ -18,7 +18,7 @@ def fetch_ligamx_matches():
     start_date = datetime.now() - timedelta(days=1)
     matches_to_process = []
 
-    for i in range(9):  # 1 pasado + hoy + 7 futuros
+    for i in range(15):  # 1 pasado + hoy + 7 futuros
         current_date = (start_date + timedelta(days=i)).strftime('%Y%m%d')
         print(f"Consultando fecha: {current_date}")
         
